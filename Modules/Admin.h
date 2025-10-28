@@ -1,4 +1,4 @@
-#define ADMINNAME "Parv"
+#define ADMINNAME "Shruti"
 #define PASSWORD "2002"
 
 int addEmployee(int connectionFD);
