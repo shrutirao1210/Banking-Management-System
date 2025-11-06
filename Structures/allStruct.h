@@ -35,4 +35,4 @@ struct Customer {
 
 struct Counter{
     int count;
-};
+}; // loan counter
