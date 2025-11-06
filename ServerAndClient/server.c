@@ -24,6 +24,7 @@
 #define COUNTERPATH "../Data/loanCounter.txt"
 #define HISTORYPATH "../Data/trans_hist.txt"
 #define FEEDPATH "../Data/feedback.txt"
+#define ADMINPATH "../Data/admin.txt"
 #define HASHKEY "123@GoodByeHashing@123"
 
 #define MAINMENU "\n===== Login As =====\n1. Customer\n2. Employee\n3. Manager\n4. Admin\n5. Exit\nEnter your choice: "

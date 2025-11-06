@@ -136,6 +136,14 @@ label1:
                                     strcpy(writeBuffer, "Password changed successfully^");
                                     write(connectionFD, writeBuffer, sizeof(writeBuffer));
                                     read(connectionFD, readBuffer, sizeof(readBuffer));                                   
+                    // Release customer semaphore to allow re-login
+                    snprintf(semName, 50, "/sem_%d", accountNumber);
+                    sem_t *sema_local = sem_open(semName, 0);
+                    if (sema_local != SEM_FAILED) {
+                        sem_post(sema_local);
+                        sem_close(sema_local);
+                        sem_unlink(semName);
+                    }
                                 }                                    
                                 goto label1;
                             case 7:
@@ -523,9 +531,8 @@ void applyLoan(int connectionFD, int accountNumber){
 void transferFunds(int connectionFD, int sourceAccount, int destAccount, float amount) {
     char readBuffer[4096], writeBuffer[4096], transactionBuffer[1024];
 
-    struct Customer cs;
+    struct Customer srcCustomer, dstCustomer, iter;
     struct trans_histroy th;
-    int isTransfer = 0;
 
     time_t s, val = 1;
 	struct tm* current_time;
@@ -539,32 +546,57 @@ void transferFunds(int connectionFD, int sourceAccount, int destAccount, float a
     int sourceFound = 0, destFound = 0;
     int srcOffset = -1, dstOffset = -1;
 
-    while (read(file, &cs, sizeof(cs)) != 0)
+    // Find both accounts' offsets
+    lseek(file, 0, SEEK_SET);
+    while (read(file, &iter, sizeof(iter)) != 0)
     {
-        if(cs.accountNumber == sourceAccount)
+        if(!sourceFound && iter.accountNumber == sourceAccount)
         {
             srcOffset = lseek(file, -sizeof(struct Customer), SEEK_CUR);
-            read(file, &cs, sizeof(cs));
             sourceFound = 1;
         }
-        if(cs.accountNumber == destAccount)
+        if(!destFound && iter.accountNumber == destAccount)
         {
             dstOffset = lseek(file, -sizeof(struct Customer), SEEK_CUR);
-            read(file, &cs, sizeof(cs));
             destFound = 1;
         }
-
         if(sourceFound && destFound)
             break;
     }
 
+    if(srcOffset == -1 || dstOffset == -1)
+    {
+        bzero(writeBuffer, sizeof(writeBuffer));
+        bzero(readBuffer, sizeof(readBuffer));
+        strcpy(writeBuffer, "Invalid source or destination account number.^");
+        write(connectionFD, writeBuffer, sizeof(writeBuffer));
+        read(connectionFD, readBuffer, sizeof(readBuffer));
+        close(fp);
+        close(file);
+        return;
+    }
+
+    // Lock and load source
     struct flock fl1 = {F_WRLCK, SEEK_SET, srcOffset, sizeof(struct Customer), getpid()};
     fcntl(file, F_SETLKW, &fl1);
-
     lseek(file, srcOffset, SEEK_SET);
-    read(file, &cs, sizeof(cs));
+    read(file, &srcCustomer, sizeof(srcCustomer));
 
-    if (cs.balance < amount) {
+    // Validate source active and funds
+    if(srcCustomer.activeStatus != 1)
+    {
+        fl1.l_type = F_UNLCK;
+        fcntl(file, F_SETLK, &fl1);
+        bzero(writeBuffer, sizeof(writeBuffer));
+        bzero(readBuffer, sizeof(readBuffer));
+        strcpy(writeBuffer, "Source account is deactivated.^");
+        write(connectionFD, writeBuffer, sizeof(writeBuffer));
+        read(connectionFD, readBuffer, sizeof(readBuffer));
+        close(fp);
+        close(file);
+        return;
+    }
+    if (srcCustomer.balance < amount) {
         bzero(writeBuffer, sizeof(writeBuffer));
         bzero(readBuffer, sizeof(readBuffer));
         printf("Insufficient funds\n");
@@ -574,14 +606,40 @@ void transferFunds(int connectionFD, int sourceAccount, int destAccount, float a
 
         fl1.l_type = F_UNLCK;
         fcntl(file, F_SETLK, &fl1);
+        close(fp);
         close(file);
         return;
     }
 
-    printf("Current balance: %.2f\n", cs.balance);
-    cs.balance -= amount; // Deduct from source account
-    float srcBalance = cs.balance;
+    // Lock and load destination
+    struct flock fl2 = {F_WRLCK, SEEK_SET, dstOffset, sizeof(struct Customer), getpid()};
+    fcntl(file, F_SETLKW, &fl2);
+    lseek(file, dstOffset, SEEK_SET);
+    read(file, &dstCustomer, sizeof(dstCustomer));
+    if(dstCustomer.activeStatus != 1)
+    {
+        fl2.l_type = F_UNLCK;
+        fcntl(file, F_SETLK, &fl2);
+        fl1.l_type = F_UNLCK;
+        fcntl(file, F_SETLK, &fl1);
+        bzero(writeBuffer, sizeof(writeBuffer));
+        bzero(readBuffer, sizeof(readBuffer));
+        strcpy(writeBuffer, "Destination account is deactivated.^");
+        write(connectionFD, writeBuffer, sizeof(writeBuffer));
+        read(connectionFD, readBuffer, sizeof(readBuffer));
+        close(fp);
+        close(file);
+        return;
+    }
 
+    // Perform transfer: deduct source
+    printf("Current balance: %.2f\n", srcCustomer.balance);
+    srcCustomer.balance -= amount;
+    float srcBalance = srcCustomer.balance;
+    lseek(file, srcOffset, SEEK_SET);
+    write(file, &srcCustomer, sizeof(srcCustomer));
+
+    // Record source transaction
     bzero(transactionBuffer, sizeof(transactionBuffer));
     printf("%.2f transferred into acc no %d from acc no %d\n", amount, destAccount, sourceAccount);
     sprintf(transactionBuffer,"%.2f transferred into acc no %d at %02d:%02d:%02d %d-%d-%d", amount, destAccount, current_time->tm_hour,current_time->tm_min,current_time->tm_sec,(current_time->tm_year)+1900,(current_time->tm_mon)+1,current_time->tm_mday);
@@ -590,27 +648,17 @@ void transferFunds(int connectionFD, int sourceAccount, int destAccount, float a
     th.acc_no = sourceAccount;
     write(fp, &th, sizeof(th));
 
-    lseek(file, -sizeof(struct Customer), SEEK_CUR);
-    write(file, &cs, sizeof(cs));
-
-    // Locking Destination Account
-    struct flock fl2 = {F_WRLCK, SEEK_SET, dstOffset, sizeof(struct Customer), getpid()};
-    fcntl(file, F_SETLKW, &fl2);
-
+    // Credit destination
+    dstCustomer.balance += amount;
     lseek(file, dstOffset, SEEK_SET);
-    read(file, &cs, sizeof(cs));
-    
-    cs.balance += amount;
+    write(file, &dstCustomer, sizeof(dstCustomer));
 
-    lseek(file, -sizeof(struct Customer), SEEK_CUR);
-    write(file, &cs, sizeof(cs));
-
+    // Unlock both
     fl1.l_type = F_UNLCK;
     fl1.l_whence = SEEK_SET;
     fl1.l_start = srcOffset;
     fl1.l_len = sizeof(struct Customer);
     fl1.l_pid = getpid();
-
     fcntl(file, F_UNLCK, &fl1);
 
     fl2.l_type = F_UNLCK;
@@ -618,9 +666,9 @@ void transferFunds(int connectionFD, int sourceAccount, int destAccount, float a
     fl2.l_start = dstOffset;
     fl2.l_len = sizeof(struct Customer);
     fl2.l_pid = getpid();
-
     fcntl(file, F_UNLCK, &fl2);
 
+    // Record destination transaction
     bzero(transactionBuffer, sizeof(transactionBuffer));
     sprintf(transactionBuffer,"%.2f credited by acc no %d at %02d:%02d:%02d %d-%d-%d", amount, sourceAccount, current_time->tm_hour,current_time->tm_min,current_time->tm_sec,(current_time->tm_year)+1900,(current_time->tm_mon)+1,current_time->tm_mday);
     bzero(th.hist, sizeof(th.hist));
@@ -628,6 +676,7 @@ void transferFunds(int connectionFD, int sourceAccount, int destAccount, float a
     th.acc_no = destAccount;
     write(fp, &th, sizeof(th));
 
+    close(fp);
     close(file);
 
     bzero(writeBuffer, sizeof(writeBuffer));
@@ -744,6 +793,7 @@ int changePassword(int connectionFD, int accountNumber){
     strcpy(newPassword, readBuffer);
 
     strcpy(c.password, crypt(newPassword, HASHKEY));
+    lseek(file, srcOffset, SEEK_SET);
     write(file, &c, sizeof(c));
 
     fl1.l_type = F_UNLCK;
@@ -782,12 +832,18 @@ void logout(int connectionFD, int id){
     // remove("../Data/login.txt");
     // rename("../Data/temp.txt", "../Data/login.txt");
 
-    snprintf(semName, 50, "/sem_%d", id);
-
-    sem_t *sema = sem_open(semName, 0);
-    if (sema != SEM_FAILED) {
+    // Try releasing via the already-opened handle first (same TU globals)
+    if (sema != NULL) {
         sem_post(sema);
-        sem_close(sema); 
+        sem_close(sema);
+    }
+
+    // Also release/unlink by name to be robust across code paths
+    snprintf(semName, 50, "/sem_%d", id);
+    sem_t *sema_by_name = sem_open(semName, 0);
+    if (sema_by_name != SEM_FAILED) {
+        sem_post(sema_by_name);
+        sem_close(sema_by_name); 
         sem_unlink(semName);    
     }
 

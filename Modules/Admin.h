@@ -7,6 +7,90 @@ void manageRole(int connectionFD);
 
 char readBuffer[4096], writeBuffer[4096];
 
+// ================ Admin Password Storage (file-backed) ================
+static int readAdminStoredHash(char *outHash, size_t outLen)
+{
+    int file = open(ADMINPATH, O_CREAT | O_RDWR, 0644);
+    if(file == -1)
+    {
+        printf("Error opening admin file!\n");
+        return 0;
+    }
+
+    // If empty, initialize with default PASSWORD
+    struct stat st;
+    if(fstat(file, &st) == -1)
+    {
+        close(file);
+        return 0;
+    }
+
+    if(st.st_size <= 0)
+    {
+        char initHash[256];
+        bzero(initHash, sizeof(initHash));
+        strcpy(initHash, crypt(PASSWORD, HASHKEY));
+
+        lseek(file, 0, SEEK_SET);
+        write(file, initHash, sizeof(initHash));
+        fsync(file);
+        lseek(file, 0, SEEK_SET);
+    }
+
+    char buf[256];
+    bzero(buf, sizeof(buf));
+    lseek(file, 0, SEEK_SET);
+    ssize_t r = read(file, buf, sizeof(buf));
+    if(r <= 0)
+    {
+        close(file);
+        return 0;
+    }
+
+    // Ensure null-termination
+    buf[255] = '\0';
+    strncpy(outHash, buf, outLen - 1);
+    outHash[outLen - 1] = '\0';
+
+    close(file);
+    return 1;
+}
+
+static int writeAdminNewPassword(const char *newPassword)
+{
+    int file = open(ADMINPATH, O_CREAT | O_RDWR, 0644);
+    if(file == -1)
+    {
+        printf("Error opening admin file!\n");
+        return 0;
+    }
+
+    // Whole-file lock while writing
+    struct flock fl = {F_WRLCK, SEEK_SET, 0, 0, getpid()};
+    if(fcntl(file, F_SETLKW, &fl) == -1)
+    {
+        close(file);
+        return 0;
+    }
+
+    char hash[256];
+    bzero(hash, sizeof(hash));
+    strcpy(hash, crypt(newPassword, HASHKEY));
+
+    lseek(file, 0, SEEK_SET);
+    ftruncate(file, 0);
+    ssize_t w = write(file, hash, sizeof(hash));
+
+    // Unlock
+    fl.l_type = F_UNLCK;
+    fcntl(file, F_SETLK, &fl);
+    close(file);
+
+    if(w != sizeof(hash))
+        return 0;
+    return 1;
+}
+
 void adminMenu(int connectionFD)
 {
     sema = initializeSemaphore(0);
@@ -38,7 +122,10 @@ label1:
     read(connectionFD, readBuffer, sizeof(readBuffer));
     strcpy(password, readBuffer);
 
-    if(strcmp(PASSWORD, password) == 0)
+    char storedHash[256];
+    bzero(storedHash, sizeof(storedHash));
+    int haveHash = readAdminStoredHash(storedHash, sizeof(storedHash));
+    if(haveHash && strcmp(storedHash, crypt(password, HASHKEY)) == 0)
     {
         bzero(writeBuffer, sizeof(writeBuffer));
         bzero(readBuffer, sizeof(readBuffer));
@@ -64,7 +151,7 @@ label1:
         bzero(readBuffer, sizeof(readBuffer));
         read(connectionFD, readBuffer, sizeof(readBuffer));
         choice = atoi(readBuffer);
-        printf("Admin entered: %d\n", choice);
+        printf("Menu entered: %d\n", choice);
 
         switch (choice) {
             case 1:
@@ -97,9 +184,49 @@ label1:
             
             case 4:
                 // Change password
+                {
+                    int ok = 0;
+                    char newPassword[256];
+
+                    bzero(writeBuffer, sizeof(writeBuffer));
+                    strcpy(writeBuffer, "Enter password: ");
+                    write(connectionFD, writeBuffer, sizeof(writeBuffer));
+
+                    bzero(readBuffer, sizeof(readBuffer));
+                    read(connectionFD, readBuffer, sizeof(readBuffer));
+                    strcpy(newPassword, readBuffer);
+
+                    ok = writeAdminNewPassword(newPassword);
+                    if(!ok)
+                    {
+                        bzero(writeBuffer, sizeof(writeBuffer));
+                        strcpy(writeBuffer, "Unable to change password\n^");
+                        write(connectionFD, writeBuffer, sizeof(writeBuffer));
+                        read(connectionFD, readBuffer, sizeof(readBuffer));
+                    }
+                    else
+                    {
+                        // Release admin semaphore to allow re-login
+                        snprintf(semName, 50, "/sem_%d", 0);
+                        sem_t *sema_local = sem_open(semName, 0);
+                        if (sema_local != SEM_FAILED) {
+                            sem_post(sema_local);
+                            sem_close(sema_local);
+                            sem_unlink(semName);
+                        }
+
+                        bzero(writeBuffer, sizeof(writeBuffer));
+                        bzero(readBuffer, sizeof(readBuffer));
+                        strcpy(writeBuffer, "Password changed successfully\nLogin with new password...\n^");
+                        write(connectionFD, writeBuffer, sizeof(writeBuffer));
+                        read(connectionFD, readBuffer, sizeof(readBuffer));
+                        goto label1;
+                    }
+                }
                 break;
             case 5:
                 // Logout
+                logout(connectionFD, 0);
                 return;
             default:
                 bzero(writeBuffer, sizeof(writeBuffer));
@@ -124,7 +251,7 @@ int addEmployee(int connectionFD)
     bzero(readBuffer, sizeof(readBuffer));
     read(connectionFD, readBuffer, sizeof(readBuffer));
     emp.empID = atoi(readBuffer);
-    printf("Admin entered empID: %d\n", emp.empID);
+    printf("Entered empID: %d\n", emp.empID);
 
     // Employee FirstName
     bzero(writeBuffer, sizeof(writeBuffer));
@@ -134,7 +261,7 @@ int addEmployee(int connectionFD)
     bzero(readBuffer, sizeof(readBuffer));
     read(connectionFD, readBuffer, sizeof(readBuffer));
     strcpy(emp.firstName, readBuffer);
-    printf("Admin entered firstName: %s\n", emp.firstName);
+    printf("Entered firstName: %s\n", emp.firstName);
 
     // Employee LastName
     bzero(writeBuffer, sizeof(writeBuffer));
@@ -144,7 +271,7 @@ int addEmployee(int connectionFD)
     bzero(readBuffer, sizeof(readBuffer));
     read(connectionFD, readBuffer, sizeof(readBuffer));
     strcpy(emp.lastName, readBuffer);
-    printf("Admin entered lastName: %s\n", emp.lastName);
+    printf("Entered lastName: %s\n", emp.lastName);
 
     // Employee Password
     bzero(writeBuffer, sizeof(writeBuffer));
@@ -181,7 +308,7 @@ void modifyCE(int connectionFD, int modifyChoice)
 {
     if(modifyChoice == 1)
     {
-        printf("Admin choose 1\n");
+        printf("Modify Customer chosen\n");
         int file = open(CUSPATH, O_CREAT | O_RDWR , 0644);
         if(file == -1)
         {
@@ -197,7 +324,7 @@ void modifyCE(int connectionFD, int modifyChoice)
         bzero(readBuffer, sizeof(readBuffer));
         read(connectionFD, readBuffer, sizeof(readBuffer));
         accNo = atoi(readBuffer);
-        printf("Admin entered account number: %d\n", accNo);
+        printf("Entered account number: %d\n", accNo);
 
 
         struct Customer c;    
@@ -229,7 +356,7 @@ void modifyCE(int connectionFD, int modifyChoice)
             bzero(readBuffer, sizeof(readBuffer));
             read(connectionFD, readBuffer, sizeof(readBuffer));
             strcpy(newName, readBuffer);
-            printf("Admin entered new Name: %s\n", newName);
+            printf("Entered new Name: %s\n", newName);
 
             strcpy(c.customerName, newName);
 
@@ -265,7 +392,7 @@ void modifyCE(int connectionFD, int modifyChoice)
 
     else if(modifyChoice == 2)
     {
-        printf("Admin choose 2\n");
+        printf("Modify Employee chosen\n");
         struct Employee emp;
         int file = open(EMPPATH, O_CREAT | O_RDWR, 0644);
         if(file == -1)
@@ -282,7 +409,7 @@ void modifyCE(int connectionFD, int modifyChoice)
         bzero(readBuffer, sizeof(readBuffer));
         read(connectionFD, readBuffer, sizeof(readBuffer));
         id = atoi(readBuffer);
-        printf("Admin entered Employee ID: %d\n", id);
+        printf("Entered Employee ID: %d\n", id);
 
         lseek(file, 0, SEEK_SET);
 
@@ -314,8 +441,8 @@ void modifyCE(int connectionFD, int modifyChoice)
             strcpy(newName, readBuffer);
 
             strcpy(emp.firstName, newName);
-            printf("Admin entered new Name: %s\n", newName);
-            printf("Admin changed name of employee: %d\n", id);
+            printf("Entered new Name: %s\n", newName);
+            printf("Changed name of employee: %d\n", id);
 
             write(file, &emp, sizeof(emp));
         }

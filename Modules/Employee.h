@@ -100,6 +100,15 @@ label1:
                         strcpy(writeBuffer,"Password changed successfully\nLogin with new password...\n^");
                         write(connectionFD, writeBuffer, sizeof(writeBuffer));
                         read(connectionFD, readBuffer, sizeof(readBuffer));
+
+                    // Release employee semaphore to allow re-login
+                    snprintf(semName, 50, "/sem_%d", empID);
+                    sem_t *sema_local = sem_open(semName, 0);
+                    if (sema_local != SEM_FAILED) {
+                        sem_post(sema_local);
+                        sem_close(sema_local);
+                        sem_unlink(semName);
+                    }
                     }                                 
                     goto label1;
                 case 5:
@@ -483,6 +492,7 @@ int changeEMPPassword(int connectionFD, int empID)
     strcpy(newPassword, readBuffer);
 
     strcpy(emp.password, crypt(newPassword, HASHKEY));
+    lseek(file, srcOffset, SEEK_SET);
     write(file, &emp, sizeof(emp));
 
     fl1.l_type = F_UNLCK;

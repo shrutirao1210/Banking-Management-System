@@ -90,6 +90,15 @@ label1:
                         strcpy(writeBuffer,"Password changed successfully\nLogin with new password...\n^");
                         write(connectionFD, writeBuffer, sizeof(writeBuffer));
                         read(connectionFD, readBuffer, sizeof(readBuffer));
+
+                        // Release manager semaphore to allow re-login
+                        snprintf(semName, 50, "/sem_%d", mngID);
+                        sem_t *sema_local = sem_open(semName, 0);
+                        if (sema_local != SEM_FAILED) {
+                            sem_post(sema_local);
+                            sem_close(sema_local);
+                            sem_unlink(semName);
+                        }
                     }                                
                     goto label1;
                 case 5:
@@ -203,7 +212,7 @@ void changeStatus(int connectionFD)
                 write(file, &cs, sizeof(cs));
                 close(file);
 
-                printf("Manager activated customer %d\n", accNo);
+                printf("Manager deactivated customer %d\n", accNo);
 
                 bzero(readBuffer, sizeof(readBuffer));
                 bzero(writeBuffer, sizeof(writeBuffer));
@@ -219,7 +228,7 @@ void changeStatus(int connectionFD)
                 write(file, &cs, sizeof(cs));
                 close(file);
 
-                printf("Manager deactivated customer %d\n", accNo);
+                printf("Manager activated customer %d\n", accNo);
 
                 bzero(readBuffer, sizeof(readBuffer));
                 bzero(writeBuffer, sizeof(writeBuffer));
@@ -403,6 +412,7 @@ int changeMNGPassword(int connectionFD, int mngID)
     strcpy(newPassword, readBuffer);
 
     strcpy(m.password, crypt(newPassword, HASHKEY));
+    lseek(file, srcOffset, SEEK_SET);
     write(file, &m, sizeof(m));
 
     fl1.l_type = F_UNLCK;
